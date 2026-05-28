@@ -1,74 +1,45 @@
-# example_app — Stirling PDF
+# Stirling PDF — example app for open-web-app
 
-A deployable example for the open-web-app deploy API. Pushes Stirling PDF (an end-user PDF editor) to your ALB on port 80.
+Two entry points in this repo, one for each deploy mode:
 
-## The build.sh contract
+- **`build.sh`** — used by EC2 mode (Image Builder runs this inside an AL2023 AMI build; details below).
+- **`Dockerfile`** — used by ECS mode (CodeBuild clones this repo, runs `docker build .`, pushes the resulting image to a private ECR, then ECS Express updates its service to use the new image). Just `FROM stirlingtools/stirling-pdf:latest` — Stirling is already a container, so the Dockerfile is one line.
 
-The deploy Step Function clones whatever `git_repo` + `git_commit` you POST, then runs `./build.sh` as root from `/src` on a fresh AL2023 EC2 instance inside Image Builder. The instance is snapshotted to an AMI immediately after `build.sh` exits, then terminated.
+[Stirling PDF](https://stirlingtools.com) is an open-source PDF editor — merge, split, rotate, OCR, encrypt, etc. All processing is local; the server is stateless.
 
-So `build.sh` must leave the system such that the **runtime instance** (launched later from the AMI by the ASG) serves:
+## What `build.sh` does
 
-- **Port 80**: the app (whatever HTTP content you want to expose)
-- **Port 8081, path `/`**: an HTTP 200 health responder (ALB target-group health check hits this; decoupled from port 80 so the app's own behavior on `/` doesn't constrain liveness signaling)
+Runs as **root on AL2023**. Working directory is the repo root.
 
-Both must be **enabled** systemd services (don't `start` them in build.sh — the build instance dies immediately; runtime instance starts them on first boot).
+1. Installs Docker, enables + starts the daemon.
+2. Pulls `stirlingtools/stirling-pdf:latest` (baked into the image so cold-boot has no network dependency).
+3. Writes `/etc/systemd/system/app.service` that runs the container with `-p 80:8080`.
+4. Writes `/etc/systemd/system/health.service` — a tiny `python3 -m http.server 8081` serving an `index.html` with `ok`. Decoupled health endpoint so the app's behavior on port 80 doesn't constrain liveness signaling.
+5. Enables both services. **Does not start them** — designed to be called inside an AMI build pipeline (Image Builder, Packer, etc.) where the build instance gets snapshotted and terminated right after; the runtime instance starts the services on first boot.
 
-This `build.sh`:
-- Installs Docker, pre-pulls `stirlingtools/stirling-pdf:latest`, enables `app.service` running the container with `-p 80:8080`.
-- Drops a one-line `index.html` and enables `health.service` running `python3 -m http.server 8081`.
-
-## Usage
-
-1. **Push this directory to a fresh public GitHub repo you own** (the deploy SFN does `git clone` over HTTPS, no auth):
-   ```bash
-   cd example_app
-   git init && git add . && git commit -m "stirling pdf"
-   git remote add origin https://github.com/YOUR_USERNAME/REPO.git
-   git push -u origin main
-   ```
-
-2. **Get the commit sha** to deploy:
-   ```bash
-   git rev-parse HEAD
-   ```
-
-3. **Get the current AL2023 AMI** (needs admin creds — mint via root console → IAM → admin → create temp access key):
-   ```bash
-   aws ssm get-parameter \
-     --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-     --query 'Parameter.Value' --output text
-   ```
-
-4. **Edit `../deploy_client/sample_payload.json`** with your values:
-   ```json
-   {
-     "git_repo": "https://github.com/YOUR_USERNAME/REPO.git",
-     "git_commit": "<sha from step 2>",
-     "base_ami_id": "<ami from step 3>"
-   }
-   ```
-
-   Optional: add `"instance_type": "t3.medium"` to override the LT's default `t3.small`. Requires the SFN ASL extension (already applied if you ran `update-stack` per the project README).
-
-5. **POST the deploy** (URL + key are in `../bootstrap_outputs.json`):
-   ```bash
-   cd ..
-   .venv/bin/python -m deploy_client.deploy \
-     --url "$(jq -r .deploy_api_url bootstrap_outputs.json)" \
-     --key "$(jq -r .deploy_api_key bootstrap_outputs.json)" \
-     --payload-file deploy_client/sample_payload.json
-   ```
-
-The Step Function takes ~15 min (~10 min Image Builder + ~3-5 min ASG instance refresh). After it `SUCCEEDED`:
+## Use it as-is
 
 ```bash
-curl -L "http://$(jq -r .alb_dns bootstrap_outputs.json)/"
+# On a fresh AL2023 instance:
+sudo ./build.sh
+sudo systemctl start app.service health.service
+curl http://localhost/        # Stirling PDF UI
+curl http://localhost:8081/   # ok
 ```
 
-Or open the URL in a browser → Stirling PDF UI.
+## Use it from an AMI builder
 
-## Notes
+The script is written to be the entire `ExecuteBash` step in an Image Builder component, or the `provisioner` in a Packer template:
 
-- **Stateless server-side**: Stirling PDF processes uploaded files in-memory / per-request. No persistent state to lose across deploys / ASG instance refreshes.
-- **First boot**: the systemd unit pulls nothing (image is baked in), starts the container in seconds. The ALB health check (`HealthCheckGracePeriod: 120`) easily covers cold start.
-- **Image pinning**: this uses `:latest`. For a real production deploy you'd pin to a digest so each `git_commit` reliably produces the same AMI. Out of scope here.
+- Don't `--now`-start anything; the AMI gets baked, terminated, then restored to fresh instances that boot up clean.
+- Health endpoint on 8081 is independent from the app — wire your load balancer's health check there.
+
+## Requirements at runtime
+
+- Amazon Linux 2023 (or any RHEL-family with `dnf` + systemd; tweak the package install line for Debian/Ubuntu)
+- ≥ 2 GB RAM (Stirling PDF + JVM idle ~500 MB)
+- Outbound HTTPS for the initial image pull (after first run, no network needed)
+
+## License
+
+This repo is just glue around an open-source app. Stirling PDF itself is MIT-licensed — see [their repo](https://github.com/Stirling-Tools/Stirling-PDF) for app questions.
